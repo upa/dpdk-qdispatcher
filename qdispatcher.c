@@ -29,19 +29,10 @@
 /* structure describing client process */
 struct client {
 	int qnum;	/* queue number for the client */
-	struct rte_mempool *rx_mp;	/* rx mempool in the client */
+	struct rte_mempool	*rx_mp;	/* rx mempool in the client */
+	struct rte_ring		*ring;	/* ring to send reply to the client */
 
-	struct rte_ether_addr mac;	/* mac addr of this client */
-	/* packets to this mac are sent to the associate queue by
-	 * rte_flow. broadcast and multicast frames are copied to the
-	 * all queues. */
-
-	struct rte_ring	*ring;	/* ring to send reply to the client */
-
-	/* params for configuring queue */
-	int nb_txd, nb_rxd;
-	struct rte_eth_txconf txconf;
-	struct rte_eth_rxconf rxconf;
+	struct msg_register reg;
 };
 
 /* structure describing qdispatcher process */
@@ -81,8 +72,8 @@ void restart_port(struct qdispatcher *qd)
 		struct client *c = qd->clients[n];
 		if (c) {
 			max_qnum = max(max_qnum, c->qnum);
-			max_txd = max(max_txd, c->nb_txd);
-			max_rxd = max(max_rxd, c->nb_rxd);
+			max_txd = max(max_txd, c->reg.nb_txd);
+			max_rxd = max(max_rxd, c->reg.nb_rxd);
 		}
 	}
 	if (max_qnum < 0) {
@@ -120,15 +111,15 @@ void restart_port(struct qdispatcher *qd)
 			continue;
 
 		pr_info("configure quene %d\n", n);
-		ret = rte_eth_tx_queue_setup(qd->portid, n, c->nb_txd,
-					     SOCKET_ID_ANY, &c->txconf);
+		ret = rte_eth_tx_queue_setup(qd->portid, n, c->reg.nb_txd,
+					     SOCKET_ID_ANY, &c->reg.txconf);
 		if (ret < 0) {
 			pr_err("failed to configure tx q %d: %s\n",
 			       n, rte_strerror(rte_errno));
 		}
 
-		ret = rte_eth_rx_queue_setup(qd->portid, n, c->nb_rxd,
-					     SOCKET_ID_ANY, &c->rxconf,
+		ret = rte_eth_rx_queue_setup(qd->portid, n, c->reg.nb_rxd,
+					     SOCKET_ID_ANY, &c->reg.rxconf,
 					     c->rx_mp);
 		if (ret < 0) {
 			pr_err("failed to configure rx q %d: %s\n",
@@ -174,12 +165,7 @@ struct client *create_client_from_register(struct msg_register *reg)
 		goto free_out;
 	}
 
-	memcpy(&c->mac, reg->mac, RTE_ETHER_ADDR_LEN);
-
-	c->nb_txd = reg->nb_txd;
-	c->nb_rxd = reg->nb_rxd;
-	c->txconf = reg->txconf;
-	c->rxconf = reg->rxconf;
+	c->reg = *reg;
 
 	return c;
 

@@ -22,11 +22,11 @@ struct msg_register {
 	struct msg_hdr hdr;
 	char	rx_mp_name[RTE_MEMZONE_NAMESIZE];
 	char	ring_name[RTE_MEMZONE_NAMESIZE];
-	char	mac[6];
 
 	int	nb_txd, nb_rxd;
 	struct rte_eth_txconf txconf;
 	struct rte_eth_rxconf rxconf;
+	struct rte_ether_addr mac;
 };
 
  struct msg_unregister {
