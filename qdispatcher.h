@@ -3,22 +3,23 @@
 
 #include <rte_ethdev.h>
 
+/* private */
+
 #define QDISPATCHER_RING_NAME	"CLIENT_TO_QDISPATCHER"
 #define QDISPATCHER_MP_NAME	"QDISPATCHER_MEMPOOL"
 
 enum {
-	QDISPATCHER_MSG_TYPE_JOIN,
+	QDISPATCHER_MSG_TYPE_REGISTER,
+	QDISPATCHER_MSG_TYPE_UNREGISTER,
 	QDISPATCHER_MSG_TYPE_REPLY,
-	QDISPATCHER_MSG_TYPE_LEAVE,
-};
+ };
 
-
-struct qdispatcher_hdr {
+struct msg_hdr {
 	int type;
 };
 
-struct qdispatcher_join {
-	struct qdispatcher_hdr hdr;
+struct msg_register {
+	struct msg_hdr hdr;
 	char	rx_mp_name[RTE_MEMZONE_NAMESIZE];
 	char	ring_name[RTE_MEMZONE_NAMESIZE];
 	char	mac[6];
@@ -28,13 +29,13 @@ struct qdispatcher_join {
 	struct rte_eth_rxconf rxconf;
 };
 
-struct qdispatcher_leave { 
-	struct qdispatcher_hdr hdr;
+ struct msg_unregister {
+	struct msg_hdr hdr;
 	int	qnum;
 };
 
-struct qdispatcher_join_reply {
-	struct qdispatcher_hdr hdr;
+struct msg_reply {
+	struct msg_hdr hdr;
 	int	ret;
 	int	err;
 	int	qnum;
