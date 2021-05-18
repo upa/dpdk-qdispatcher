@@ -23,13 +23,13 @@ struct msg_register {
 	char	rx_mp_name[RTE_MEMZONE_NAMESIZE];
 	char	ring_name[RTE_MEMZONE_NAMESIZE];
 
-	int	nb_txd, nb_rxd;
+	uint16_t	nb_txd, nb_rxd;
 	struct rte_eth_txconf txconf;
 	struct rte_eth_rxconf rxconf;
 	struct rte_ether_addr mac;
 };
 
- struct msg_unregister {
+struct msg_unregister {
 	struct msg_hdr hdr;
 	int	qnum;
 };
@@ -43,13 +43,21 @@ struct msg_reply {
 
 /* err code */
 enum {
-	QDISPATCHER_ERR_NONE,
+	QDERR_NONE = 0,
 
 	/* join */
-	QDISPATCHER_ERR_NO_AVAILABLE_QUEUE,
+	QDERR_NO_QUEUE,
+	QDERR_NO_MEMORY,
+	QDERR_NO_RXMEMPOOL,
+	QDERR_NO_RING,
+	QDERR_NO_MEMSPACE,
+	QDERR_NO_RINGSPACE,
+	QDERR_TIMEOUT,
 
 	/* leave */
-	QDISPATCHER_ERR_NO_REGISTERED_QUEUE_NUM,
+	QDERR_NO_REGISTERED_QUEUE,
+
+	QDERR_MAX,
 };
 
 

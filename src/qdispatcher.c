@@ -11,20 +11,7 @@
 #include <rte_debug.h>
 
 #include <qdispatcher.h>
-
-#define pr_info(fmt, ...) fprintf(stdout, "INFO:%s(): " fmt,	\
-				  __func__, ##__VA_ARGS__)
-
-#define pr_warn(fmt, ...) fprintf(stderr, "\x1b[1m\x1b[33m"     \
-				  "WARN:%s(): " fmt "\x1b[0m",  \
-				  __func__, ##__VA_ARGS__)
-
-#define pr_err(fmt, ...) fprintf(stderr, "\x1b[1m\x1b[31m"      \
-				 "ERR:%s(): " fmt "\x1b[0m",    \
-				 __func__, ##__VA_ARGS__)
-
-#define min(a, b) (a > b) ? b : a
-#define max(a, b) (a > b) ? a : b
+#include <util.h>
 
 /* structure describing client process */
 struct client {
@@ -141,7 +128,7 @@ void restart_port(struct qdispatcher *qd)
 
 /**** handle register ****/
 
-struct client *create_client_from_register(struct msg_register *reg)
+struct client *create_client_from_register(struct msg_register *reg, int *err)
 {
 	struct client *c;
 
@@ -149,24 +136,28 @@ struct client *create_client_from_register(struct msg_register *reg)
 	if (!c) {
 		pr_err("failed to alloc memory for client: %s\n",
 		       strerror(errno));
+		*err = QDERR_NO_MEMORY;
 		return NULL;
+	}
+
+	c->ring = rte_ring_lookup(reg->ring_name);
+	if (!c->ring) {
+		pr_err("ring_name %s not found\n", reg->ring_name);
+		*err = QDERR_NO_RING;
+		goto free_out;
 	}
 
 	memset(c, 0, sizeof(*c));
 	c->rx_mp = rte_mempool_lookup(reg->rx_mp_name);
 	if (!c->rx_mp) {
 		pr_err("rx_mp_name %s not found\n", reg->rx_mp_name);
-		goto free_out;
-	}
-
-	c->ring = rte_ring_lookup(reg->ring_name);
-	if (!c->ring) {
-		pr_err("ring_name %s not found\n", reg->ring_name);
-		goto free_out;
+		*err = QDERR_NO_RXMEMPOOL;
+		goto out;
 	}
 
 	c->reg = *reg;
 
+out:
 	return c;
 
 free_out:
@@ -198,12 +189,16 @@ void send_reply(struct qdispatcher *qd, struct rte_ring *r,
 void handle_register(struct qdispatcher *qd, struct msg_register *reg)
 {
 	struct client *c;
-	int n, q, ret = 0, err = QDISPATCHER_ERR_NONE;
+	int n, q, ret = 0, err = QDERR_NONE;
 
-	c = create_client_from_register(reg);
+	c = create_client_from_register(reg, &err);
 	if (!c) {
 		pr_err("failed to add client\n");
 		goto out;
+	}
+	if (err != QDERR_NONE) {
+		ret = -1;
+		goto reply_out;
 	}
 
 	/* find an available queue number for this client*/
@@ -218,7 +213,7 @@ void handle_register(struct qdispatcher *qd, struct msg_register *reg)
 	if (q < 0) {
 		pr_err("no available queue for the client\n");
 		ret = -1;
-		err = QDISPATCHER_ERR_NO_AVAILABLE_QUEUE;
+		err = QDERR_NO_QUEUE;
 		goto reply_out;
 	}
 
@@ -238,7 +233,7 @@ out:
 void handle_unregister(struct qdispatcher *qd, struct msg_unregister *unreg)
 {
 	struct client *remove = NULL;
-	int n, ret = 0, err = QDISPATCHER_ERR_NONE;
+	int n, ret = 0, err = QDERR_NONE;
 
 	for (n = 0; n < qd->nqueues; n++) {
 		struct client *c = qd->clients[n];
@@ -251,7 +246,7 @@ void handle_unregister(struct qdispatcher *qd, struct msg_unregister *unreg)
 	if (!remove) {
 		pr_err("no client for qnum %d\n", unreg->qnum);
 		ret = -1;
-		err = QDISPATCHER_ERR_NO_REGISTERED_QUEUE_NUM;
+		err = QDERR_NO_REGISTERED_QUEUE;
 		goto reply_out;
 	}
 
