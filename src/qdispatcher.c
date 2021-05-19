@@ -128,7 +128,7 @@ void restart_port(struct qdispatcher *qd)
 
 /**** handle register ****/
 
-struct client *create_client_from_register(struct msg_register *reg, int *err)
+struct client *create_client_from_register(struct msg_register *reg, int *ret)
 {
 	struct client *c;
 
@@ -136,14 +136,14 @@ struct client *create_client_from_register(struct msg_register *reg, int *err)
 	if (!c) {
 		pr_err("failed to alloc memory for client: %s\n",
 		       strerror(errno));
-		*err = QDERR_NO_MEMORY;
+		*ret = QDERR_NO_MEMORY;
 		return NULL;
 	}
 
 	c->ring = rte_ring_lookup(reg->ring_name);
 	if (!c->ring) {
 		pr_err("ring_name %s not found\n", reg->ring_name);
-		*err = QDERR_NO_RING;
+		*ret = QDERR_NO_RING;
 		goto free_out;
 	}
 
@@ -151,9 +151,11 @@ struct client *create_client_from_register(struct msg_register *reg, int *err)
 	c->rx_mp = rte_mempool_lookup(reg->rx_mp_name);
 	if (!c->rx_mp) {
 		pr_err("rx_mp_name %s not found\n", reg->rx_mp_name);
-		*err = QDERR_NO_RXMEMPOOL;
+		*ret = QDERR_NO_RXMEMPOOL;
 		goto out;
 	}
+
+	*ret = 0;
 
 	c->reg = *reg;
 
@@ -165,8 +167,7 @@ free_out:
 	return NULL;
 }
 
-void send_reply(struct qdispatcher *qd, struct rte_ring *r,
-		int ret, int err, int qnum)
+void send_reply(struct qdispatcher *qd, struct rte_ring *r, int ret, int qnum)
 {
 	struct msg_reply *rep;
 	void *msg;
@@ -179,7 +180,6 @@ void send_reply(struct qdispatcher *qd, struct rte_ring *r,
 	rep = msg;
 	rep->hdr.type = QDISPATCHER_MSG_TYPE_REPLY;
 	rep->ret = ret;
-	rep->err = err;
 	rep->qnum = qnum;
 
 	if (rte_ring_enqueue(r, rep) < 0)
@@ -189,17 +189,15 @@ void send_reply(struct qdispatcher *qd, struct rte_ring *r,
 void handle_register(struct qdispatcher *qd, struct msg_register *reg)
 {
 	struct client *c;
-	int n, q, ret = 0, err = QDERR_NONE;
+	int n, q, ret = 0;
 
-	c = create_client_from_register(reg, &err);
+	c = create_client_from_register(reg, &ret);
 	if (!c) {
 		pr_err("failed to add client\n");
 		goto out;
 	}
-	if (err != QDERR_NONE) {
-		ret = -1;
+	if (ret != 0)
 		goto reply_out;
-	}
 
 	/* find an available queue number for this client*/
 	for (q = -1, n = 0; n < qd->nqueues; n++) {
@@ -212,8 +210,7 @@ void handle_register(struct qdispatcher *qd, struct msg_register *reg)
 	}
 	if (q < 0) {
 		pr_err("no available queue for the client\n");
-		ret = -1;
-		err = QDERR_NO_QUEUE;
+		ret = QDERR_NO_QUEUE;
 		goto reply_out;
 	}
 
@@ -222,7 +219,7 @@ void handle_register(struct qdispatcher *qd, struct msg_register *reg)
 	restart_port(qd);
 
 reply_out:
-	send_reply(qd, c->ring, ret, err, q);
+	send_reply(qd, c->ring, ret, q);
 out:
 	rte_mempool_put(qd->mp, reg);
 
@@ -233,7 +230,7 @@ out:
 void handle_unregister(struct qdispatcher *qd, struct msg_unregister *unreg)
 {
 	struct client *remove = NULL;
-	int n, ret = 0, err = QDERR_NONE;
+	int n, ret = 0;
 
 	for (n = 0; n < qd->nqueues; n++) {
 		struct client *c = qd->clients[n];
@@ -245,8 +242,7 @@ void handle_unregister(struct qdispatcher *qd, struct msg_unregister *unreg)
 
 	if (!remove) {
 		pr_err("no client for qnum %d\n", unreg->qnum);
-		ret = -1;
-		err = QDERR_NO_REGISTERED_QUEUE;
+		ret = QDERR_NO_REGISTERED_QUEUE;
 		goto reply_out;
 	}
 
@@ -254,7 +250,7 @@ void handle_unregister(struct qdispatcher *qd, struct msg_unregister *unreg)
 	restart_port(qd);
 
 reply_out:
-	send_reply(qd, remove->ring, ret, err, unreg->qnum);
+	send_reply(qd, remove->ring, ret, unreg->qnum);
 	rte_mempool_put(qd->mp, unreg);
 
 	if (ret == 0) /* success  */

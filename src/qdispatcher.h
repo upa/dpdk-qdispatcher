@@ -37,7 +37,6 @@ struct msg_unregister {
 struct msg_reply {
 	struct msg_hdr hdr;
 	int	ret;
-	int	err;
 	int	qnum;
 };
 

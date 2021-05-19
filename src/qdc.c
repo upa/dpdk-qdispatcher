@@ -33,20 +33,19 @@ struct qdc {
 	int qnum;
 };
 
-static int do_register(qdc_t *qdc, int *qnum)
+static int send_msg(qdc_t *qdc, struct msg_hdr *hdr, size_t size,
+		    struct msg_reply **rep)
 {
 	int timeout = 1000 * 1000;	/* 1sec */
-	struct msg_reply *rep;
 	void *msg;
-	int ret;
+	int ret = 0;
 
-	/* send register message */
 	if (rte_mempool_get(qdc->d_mp, &msg) < 0) {
 		pr_err("no available message in the pool\n");
 		return QDERR_NO_MEMSPACE;
 	}
 
-	memcpy(msg, &qdc->reg, sizeof(qdc->reg));
+	memcpy(msg, hdr, size);
 	if (rte_ring_enqueue(qdc->d_ring, msg) < 0) {
 		pr_err("failed to put register msg to the ring\n");
 		return QDERR_NO_RINGSPACE;
@@ -62,12 +61,27 @@ static int do_register(qdc_t *qdc, int *qnum)
 		}
 	}
 
-	rep = msg;
-	if (rep->ret == 0)
-		*qnum = rep->qnum;
-	ret = rep->err; /* QDERR_NONE (0) is ok */
+	*rep = msg;
 
-	rte_mempool_put(qdc->d_mp, msg);
+	return ret;
+}
+
+static int do_register(qdc_t *qdc, int *qnum)
+{
+	struct msg_reply *rep;
+	int ret;
+
+	ret = send_msg(qdc, (struct msg_hdr *)&qdc->reg,
+		       sizeof(qdc->reg), &rep);
+	if (ret != 0)
+		return ret;
+
+	if (rep->ret == 0) {
+		*qnum = rep->qnum;
+		ret = rep->ret;
+	}
+
+	rte_mempool_put(qdc->d_mp, rep);
 
 	return ret;
 }
@@ -138,7 +152,23 @@ free_out:
 
 int qdc_unregister(qdc_t *qdc)
 {
-	return 0;
+	struct msg_unregister unreg;
+	struct msg_reply *rep;
+	int ret;
+
+	unreg.hdr.type = QDISPATCHER_MSG_TYPE_UNREGISTER;
+	unreg.qnum = qdc->qnum;
+
+	ret = send_msg(qdc, (struct msg_hdr *)&unreg, sizeof(unreg), &rep);
+	if (ret != 0)
+		return ret;
+
+	if (rep->ret != 0)
+		ret = rep->ret;
+
+	rte_mempool_put(qdc->d_mp, rep);
+
+	return ret;
 }
 
 
