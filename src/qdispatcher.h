@@ -1,12 +1,14 @@
 #ifndef _QDISPATCHER_H_
 #define _QDISPATCHER_H_
 
+#include <string.h>
+
 #include <rte_ethdev.h>
 
 /* private */
 
-#define QDISPATCHER_RING_NAME	"CLIENT_TO_QDISPATCHER"
-#define QDISPATCHER_MP_NAME	"QDISPATCHER_MEMPOOL"
+#define QDISPATCHER_SOCK_PATH "/tmp/qdispatcher.sock"
+
 
 enum {
 	QDISPATCHER_MSG_TYPE_REGISTER,
@@ -40,24 +42,6 @@ struct msg_reply {
 	int	qnum;
 };
 
-/* err code */
-enum {
-	QDERR_NONE = 0,
-
-	/* join */
-	QDERR_NO_QUEUE,
-	QDERR_NO_MEMORY,
-	QDERR_NO_RXMEMPOOL,
-	QDERR_NO_RING,
-	QDERR_NO_MEMSPACE,
-	QDERR_NO_RINGSPACE,
-	QDERR_TIMEOUT,
-
-	/* leave */
-	QDERR_NO_REGISTERED_QUEUE,
-
-	QDERR_MAX,
-};
 
 
 #endif /* _QDISPATCHER_H_ */

@@ -25,3 +25,5 @@ target_include_directories(qdc PUBLIC
 				)
 target_link_libraries(qdc ${LIBDPDK_LIBRARIES})
 target_compile_options(qdc PRIVATE ${LIBDPDK_CFLAGS_OTHER})
+
+add_subdirectory(./test)

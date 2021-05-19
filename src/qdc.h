@@ -12,10 +12,10 @@ qdc_t *qdc_register(struct rte_mempool *rx_mp,
 		    struct rte_eth_rxconf rxconf,
 		    struct rte_ether_addr mac);
 
-
 int qdc_unregister(qdc_t *qdc);
 
 int qdc_qnum(qdc_t *qdc);
 
+const char *qd_strerror(int ret);
 
 #endif /* _QDC_H_ */

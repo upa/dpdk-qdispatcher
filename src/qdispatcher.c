@@ -3,7 +3,10 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sys/queue.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <rte_eal.h>
 #include <rte_malloc.h>
@@ -17,8 +20,6 @@
 struct client {
 	int qnum;	/* queue number for the client */
 	struct rte_mempool	*rx_mp;	/* rx mempool in the client */
-	struct rte_ring		*ring;	/* ring to send reply to the client */
-
 	struct msg_register reg;
 };
 
@@ -28,11 +29,7 @@ struct qdispatcher {
 	struct rte_eth_conf 	conf;
 	struct rte_eth_dev_info	info;
 
-	struct rte_ring	*ring;	/* ring to recv msg from clients */
-	struct rte_mempool *mp; /* mp for messages over rings.  all
-				 * clients and qdispatcher allocates
-				 * message from this mp.
-				 */
+	int fd;	/* unix domain socket fd */
 
 	int nqueues;
 	struct client **clients;	/* number of nqueues array of
@@ -46,9 +43,8 @@ struct qdispatcher {
 static struct qdispatcher qd;
 
 
-
 /**** restart the port ****/
-void restart_port(struct qdispatcher *qd)
+static int restart_port(struct qdispatcher *qd)
 {
 	int ret, n, max_qnum = -1;
 	uint16_t max_txd = 512, max_rxd = 512;
@@ -64,8 +60,8 @@ void restart_port(struct qdispatcher *qd)
 		}
 	}
 	if (max_qnum < 0) {
-		pr_err("no runnable queues\n");
-		return;
+		pr_info("no queues registered, stop device\n");
+		return 0; /* keep device stopping */
 	}
 	max_qnum++; /* queue number + 1 means number of queues */
 
@@ -73,22 +69,22 @@ void restart_port(struct qdispatcher *qd)
 	ret = rte_eth_dev_stop(qd->portid);
 	if (ret < 0) {
 		pr_err("failed to stop port %d\n", qd->portid);
-		return;
+		return -EBUSY;
 	}
 
 	/* configure port */
 	ret = rte_eth_dev_adjust_nb_rx_tx_desc(qd->portid, &max_txd, &max_rxd);
 	if (ret < 0) {
-		pr_err("failed to configure port %d: %s\n",
+		pr_err("failed to adjust desc on port %d: %s\n",
 		       qd->portid, rte_strerror(rte_errno));
-		return;
+		return -EINVAL;
 	}
 
 	ret = rte_eth_dev_configure(qd->portid, max_qnum, max_qnum, &qd->conf);
 	if (ret < 0) {
 		pr_err("failed to configure port %d: %s\n",
 		       qd->portid, rte_strerror(rte_errno));
-		return;
+		return -EINVAL;
 	}
 
 	/* configure queues */
@@ -97,7 +93,7 @@ void restart_port(struct qdispatcher *qd)
 		if (!c)
 			continue;
 
-		pr_info("configure quene %d\n", n);
+		pr_info("configure port %d quene %d\n", qd->portid, n);
 		ret = rte_eth_tx_queue_setup(qd->portid, n, c->reg.nb_txd,
 					     SOCKET_ID_ANY, &c->reg.txconf);
 		if (ret < 0) {
@@ -121,9 +117,11 @@ void restart_port(struct qdispatcher *qd)
 	if (ret < 0) {
 		pr_err("failed to start port %d: %s\n",
 		       qd->portid, rte_strerror(rte_errno));
+		return -EINVAL;
 	}
 
 	pr_info("restart port %d done\n", qd->portid);
+	return 0;
 }
 
 /**** handle register ****/
@@ -136,30 +134,21 @@ struct client *create_client_from_register(struct msg_register *reg, int *ret)
 	if (!c) {
 		pr_err("failed to alloc memory for client: %s\n",
 		       strerror(errno));
-		*ret = QDERR_NO_MEMORY;
+		*ret = errno;
 		return NULL;
 	}
-
-	c->ring = rte_ring_lookup(reg->ring_name);
-	if (!c->ring) {
-		pr_err("ring_name %s not found\n", reg->ring_name);
-		*ret = QDERR_NO_RING;
-		goto free_out;
-	}
-
 	memset(c, 0, sizeof(*c));
+
 	c->rx_mp = rte_mempool_lookup(reg->rx_mp_name);
 	if (!c->rx_mp) {
 		pr_err("rx_mp_name %s not found\n", reg->rx_mp_name);
-		*ret = QDERR_NO_RXMEMPOOL;
-		goto out;
+		*ret = -ENOENT;
+		goto free_out;
 	}
 
+	c->reg = *reg;
 	*ret = 0;
 
-	c->reg = *reg;
-
-out:
 	return c;
 
 free_out:
@@ -167,37 +156,32 @@ free_out:
 	return NULL;
 }
 
-void send_reply(struct qdispatcher *qd, struct rte_ring *r, int ret, int qnum)
+static void send_reply(int fd, int ret, int qnum)
 {
-	struct msg_reply *rep;
-	void *msg;
+	struct msg_reply rep;
+	int r;
 
-	if (rte_mempool_get(qd->mp, &msg) < 0) {
-		pr_err("no avaliable message in the pool\n");
-		return;
-	}
-
-	rep = msg;
-	rep->hdr.type = QDISPATCHER_MSG_TYPE_REPLY;
-	rep->ret = ret;
-	rep->qnum = qnum;
-
-	if (rte_ring_enqueue(r, rep) < 0)
-		pr_err("failed to put reply to the ring\n");
+	rep.hdr.type = QDISPATCHER_MSG_TYPE_REPLY;
+	rep.ret = ret;
+	rep.qnum = qnum;
+	
+	r = write(fd, &rep, sizeof(rep));
+	if (r < 0)
+		pr_err("write failed: %s\n", strerror(errno));
 }
 
-void handle_register(struct qdispatcher *qd, struct msg_register *reg)
+static void handle_register(struct qdispatcher *qd, int fd,
+			    struct msg_hdr *hdr)
 {
+	struct msg_register *reg = (struct msg_register *)hdr;
 	struct client *c;
 	int n, q, ret = 0;
 
 	c = create_client_from_register(reg, &ret);
-	if (!c) {
+	if (!c || ret != 0) {
 		pr_err("failed to add client\n");
 		goto out;
 	}
-	if (ret != 0)
-		goto reply_out;
 
 	/* find an available queue number for this client*/
 	for (q = -1, n = 0; n < qd->nqueues; n++) {
@@ -210,25 +194,26 @@ void handle_register(struct qdispatcher *qd, struct msg_register *reg)
 	}
 	if (q < 0) {
 		pr_err("no available queue for the client\n");
-		ret = QDERR_NO_QUEUE;
-		goto reply_out;
+		ret = -ENOSPC;
+		goto out;
 	}
 
 	pr_info("assign a new client to q %d\n", c->qnum);
 
-	restart_port(qd);
+	ret = restart_port(qd);
 
-reply_out:
-	send_reply(qd, c->ring, ret, q);
 out:
-	rte_mempool_put(qd->mp, reg);
+	if (c)
+		send_reply(fd, ret, q);
 
 	if (ret < 0) /* faileed to register. release the client */
 		free(c);
 }
 
-void handle_unregister(struct qdispatcher *qd, struct msg_unregister *unreg)
+static void handle_unregister(struct qdispatcher *qd, int fd,
+			      struct msg_hdr *hdr)
 {
+	struct msg_unregister *unreg = (struct msg_unregister *)hdr;
 	struct client *remove = NULL;
 	int n, ret = 0;
 
@@ -242,54 +227,107 @@ void handle_unregister(struct qdispatcher *qd, struct msg_unregister *unreg)
 
 	if (!remove) {
 		pr_err("no client for qnum %d\n", unreg->qnum);
-		ret = QDERR_NO_REGISTERED_QUEUE;
+		ret = -ENOENT;
+		pr_info("ret %d\n", ret);
 		goto reply_out;
 	}
 
+	pr_info("unregister queue %d\n", remove->qnum);
+
 	qd->clients[remove->qnum] = NULL;
-	restart_port(qd);
+	ret = restart_port(qd);
 
 reply_out:
-	send_reply(qd, remove->ring, ret, unreg->qnum);
-	rte_mempool_put(qd->mp, unreg);
+	send_reply(fd, ret, unreg->qnum);
 
 	if (ret == 0) /* success  */
 		free(remove);
 }
 
-int dispatch_loop(struct qdispatcher *qd)
+static int dispatch_loop(struct qdispatcher *qd)
 {
+	struct sockaddr_un sun;
+	struct msg_hdr *hdr;
+	socklen_t sunlen;
+	char buf[1024];
+	int ret;
+
 	pr_info("start qdispatcher for port %d\n", qd->portid);
 
+	listen(qd->fd, 10);
+
 	while (1) {
-		struct msg_hdr *hdr;
-		void *msg;
-		if (rte_ring_dequeue(qd->ring, &msg) < 0) {
-			usleep(10);
+		int fd;
+
+		sunlen = sizeof(sun);
+		fd = accept(qd->fd, (struct sockaddr *)&sun, &sunlen);
+		if (fd < 0) {
+			pr_err("accept failed: %s\n", strerror(errno));
 			continue;
 		}
 
-		hdr = msg;
+		ret = read(fd, buf, sizeof(buf));
+		if (ret < 0) {
+			pr_err("read failed: %s\n", strerror(errno));
+			goto close_fd;
+		}
+
+		hdr = (struct msg_hdr *)buf;
 
 		switch (hdr->type) {
 		case QDISPATCHER_MSG_TYPE_REGISTER:
-			handle_register(qd, (struct msg_register *)hdr);
+			if (ret < sizeof(struct msg_register)) {
+				pr_err("invalid msg length for register\n");
+				continue;
+			}
+			handle_register(qd, fd, hdr);
 			break;
 		case QDISPATCHER_MSG_TYPE_UNREGISTER:
-			handle_unregister(qd, (struct msg_unregister *)hdr);
+			if (ret < sizeof(struct msg_unregister)) {
+				pr_err("invalid msg length for unregister\n");
+				continue;
+			}
+			handle_unregister(qd, fd, hdr);
 			break;
 		default:
 			pr_err("invalid hdr type %d\n", hdr->type);
 			break;
 		}
+
+	close_fd:
+		close(fd);
 	}
 
 	return 0;
 }
 
 
-static const char *qd_ring_name = QDISPATCHER_RING_NAME;
-static const char *qd_mp_name = QDISPATCHER_MP_NAME;
+static int init_unix_sock(void)
+{
+	struct sockaddr_un sun;
+	int fd;
+
+	unlink(QDISPATCHER_SOCK_PATH); /* XXX: terrible work */
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		pr_err("failed to create unix domain socket: %s\n",
+		       strerror(errno));
+		return -1;
+	}
+
+	sun.sun_family = AF_UNIX;
+	strncpy(sun.sun_path, QDISPATCHER_SOCK_PATH, sizeof(sun.sun_path));
+
+	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+		pr_err("failed to bind unix domain socket: %s\n",
+		       strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+}
 
 int main(int argc, char **argv)
 {
@@ -307,27 +345,9 @@ int main(int argc, char **argv)
 	memset(&qd, 0, sizeof(qd));
 	qd.portid = 0;	/* XXX: implement qdispater_parse_args() */
 
-	/* initialize a ring on qdispatcher. clients request
-	 * register/unregister to the qdispatcher via this ring. So,
-	 * multiple processes put messages to the qd.ring, so it
-	 * should be RING_F_MP_ */
-	qd.ring = rte_ring_create(qd_ring_name, 32, rte_socket_id(),
-				  RING_F_MP_HTS_ENQ);
-	if (!qd.ring) {
-		rte_exit(EXIT_FAILURE, "failed to alloc qd ring: %s\n",
-			 rte_strerror(rte_errno));
-	}
-
-	/* all messages between qdispather and each client are
-	 * obtained from this mempool to simplify releasing the messages. */
-	qd.mp = rte_mempool_create(qd_mp_name, 512,
-				   sizeof(struct msg_register), 0, 0,
-				   NULL, NULL, NULL, NULL,
-				   rte_socket_id(), 0);
-	if (!qd.mp) {
-		rte_exit(EXIT_FAILURE, "failed to alloc mp for ring: %s\n",
-			 rte_strerror(rte_errno));
-	}
+	qd.fd = init_unix_sock();
+	if (qd.fd < 0)
+		return -1;
 
 	/* prepare port conf */
 	ret = rte_eth_dev_info_get(qd.portid, &qd.info);
@@ -339,8 +359,11 @@ int main(int argc, char **argv)
 
 	/* XXX */
 	qd.conf.txmode.offloads = qd.info.tx_offload_capa;
-	qd.conf.rxmode.offloads = qd.info.rx_offload_capa;
+	qd.conf.rxmode.offloads = (DEV_RX_OFFLOAD_CHECKSUM |
+                                     DEV_RX_OFFLOAD_TCP_LRO |
+				   DEV_RX_OFFLOAD_SCATTER); /* XXX: LRO only */
 	qd.conf.rxmode.max_lro_pkt_size = qd.info.max_lro_pkt_size;
+
 	qd.conf.txmode.mq_mode = ETH_MQ_TX_NONE;
 	qd.conf.rxmode.mq_mode = ETH_MQ_RX_NONE;
 

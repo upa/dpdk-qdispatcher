@@ -3,7 +3,10 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sys/queue.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <poll.h>
 
 #include <rte_eal.h>
 #include <rte_malloc.h>
@@ -14,80 +17,95 @@
 #include <qdc.h>
 #include <util.h>
 
-static void random_text(char *txt, size_t size)
-{
-	int n;
-	char chars[] = "0123456789abcdefghijklmnopqrstuvwxyz";
 
-	for (n = 0; n < size - 1; n++) {
-		txt[n] = chars[rand() & sizeof(chars)];
+static int init_unix_sock(void)
+{
+	struct sockaddr_un sun;
+	int fd;
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		pr_err("failed to create unix domain socket: %s\n",
+		       strerror(errno));
+		return -1 * errno;
 	}
-	txt[n] = '\0';
+
+	sun.sun_family = AF_UNIX;
+	strncpy(sun.sun_path, QDISPATCHER_SOCK_PATH, sizeof(sun.sun_path));
+
+	if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+		pr_err("failed to connect to %s: %s\n",
+		       sun.sun_path, strerror(errno));
+		close(fd);
+		return -1 * errno;
+	}
+
+	return fd;
 }
 
 struct qdc {
-	struct rte_ring *c_ring;	/* my (client) ring */
-	struct rte_ring *d_ring;	/* dispatcher's ring */
+	int qnum;
 	struct rte_mempool *d_mp;	/* dispatcher's mempool */
 	struct msg_register reg;
-	int qnum;
+
 };
 
-static int send_msg(qdc_t *qdc, struct msg_hdr *hdr, size_t size,
-		    struct msg_reply **rep)
+static int send_msg(int fd, struct msg_hdr *hdr, size_t size,
+		    struct msg_reply *rep)
 {
-	int timeout = 1000 * 1000;	/* 1sec */
-	void *msg;
+	struct pollfd x[1];
 	int ret = 0;
 
-	if (rte_mempool_get(qdc->d_mp, &msg) < 0) {
-		pr_err("no available message in the pool\n");
-		return QDERR_NO_MEMSPACE;
+	ret = write(fd, hdr, size);
+	if (ret < 0) {
+		pr_err("write failed: %s\n", strerror(errno));
+		return -1 * errno;
 	}
 
-	memcpy(msg, hdr, size);
-	if (rte_ring_enqueue(qdc->d_ring, msg) < 0) {
-		pr_err("failed to put register msg to the ring\n");
-		return QDERR_NO_RINGSPACE;
-	}
+	x[0].fd = fd;
+	x[0].events = POLLIN;
 
 	/* wait reply */
-	while (rte_ring_dequeue(qdc->c_ring, &msg) < 0) {
-		usleep(10);
-		timeout -= 10;
-		if (timeout < 0) {
-			pr_err("timed out\n");
-			return QDERR_TIMEOUT;
-		}
+	ret = poll(x, 1, 1000);	/* timeout 1 sec */
+	if (ret < 0) {
+		pr_err("poll failed: %s\n", strerror(errno));
+		return -1 * errno;
 	}
 
-	*rep = msg;
+	if (ret == 0)
+		return -ETIMEDOUT;
 
-	return ret;
+	ret = read(fd, rep, sizeof(*rep));
+	if (ret < 0) {
+		pr_err("read failed: %s\n", strerror(errno));
+		return -1 * errno;
+	}
+
+	return 0;
 }
 
-static int do_register(qdc_t *qdc, int *qnum)
+static int do_register(qdc_t *qdc)
 {
-	struct msg_reply *rep;
-	int ret;
+	struct msg_reply rep;
+	int ret, fd;
 
-	ret = send_msg(qdc, (struct msg_hdr *)&qdc->reg,
-		       sizeof(qdc->reg), &rep);
-	if (ret != 0)
+	fd = init_unix_sock();
+	if (fd < 0)
+		return -1;
+
+	ret = send_msg(fd, (struct msg_hdr *)&qdc->reg, sizeof(qdc->reg),
+		       &rep);
+	if (ret < 0)
 		return ret;
 
-	if (rep->ret == 0) {
-		*qnum = rep->qnum;
-		ret = rep->ret;
+	if (rep.ret == 0) {
+		qdc->qnum = rep.qnum;
+		ret = rep.ret;
 	}
-
-	rte_mempool_put(qdc->d_mp, rep);
 
 	return ret;
 }
 
-static const char *qd_ring_name = QDISPATCHER_RING_NAME;
-static const char *qd_mp_name = QDISPATCHER_MP_NAME;
 
 qdc_t *qdc_register(struct rte_mempool *rx_mp,
 		    uint16_t nb_txd, uint16_t nb_rxd,
@@ -114,31 +132,10 @@ qdc_t *qdc_register(struct rte_mempool *rx_mp,
 	qdc->reg.rxconf = rxconf;
 	qdc->reg.mac = mac;
 
-	/* create client ring */
-	random_text(qdc->reg.ring_name, RTE_MEMZONE_NAMESIZE);
-	qdc->c_ring = rte_ring_create(qdc->reg.ring_name, 32,
-				      rte_socket_id(), 0);
-	if (!qdc->c_ring) {
-		pr_err("failed to create ring: %s\n", rte_strerror(rte_errno));
-		goto free_out;
-	}
-
-	qdc->d_ring = rte_ring_lookup(qd_ring_name);
-	if (!qdc->d_ring) {
-		pr_err("ring %s not found\n", qd_ring_name);
-		goto free_out;
-	}
-
-	qdc->d_mp = rte_mempool_lookup(qd_mp_name);
-	if (!qdc->d_mp) {
-		pr_err("mempool %s not found\n", qd_mp_name);
-		goto free_out;
-	}
-
 	/* try register */
-	ret = do_register(qdc, &qdc->qnum);
-	if (ret != 0) {
-		pr_err("registration failed: err %d\n", ret);
+	ret = do_register(qdc);
+	if (ret < 0) {
+		pr_err("registration failed: %s\n", strerror(ret * -1));
 		goto free_out;
 	}
 
@@ -153,20 +150,22 @@ free_out:
 int qdc_unregister(qdc_t *qdc)
 {
 	struct msg_unregister unreg;
-	struct msg_reply *rep;
-	int ret;
+	struct msg_reply rep;
+	int ret, fd;
 
 	unreg.hdr.type = QDISPATCHER_MSG_TYPE_UNREGISTER;
 	unreg.qnum = qdc->qnum;
 
-	ret = send_msg(qdc, (struct msg_hdr *)&unreg, sizeof(unreg), &rep);
-	if (ret != 0)
+	fd = init_unix_sock();
+	if (fd < 0)
+		return -1;
+
+	ret = send_msg(fd, (struct msg_hdr *)&unreg, sizeof(unreg), &rep);
+	if (ret < 0)
 		return ret;
 
-	if (rep->ret != 0)
-		ret = rep->ret;
-
-	rte_mempool_put(qdc->d_mp, rep);
+	if (rep.ret < 0)
+		ret = rep.ret;
 
 	return ret;
 }
