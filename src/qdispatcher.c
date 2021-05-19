@@ -107,8 +107,8 @@ static int restart_port(struct qdispatcher *qd)
 
 		}
 
-		pr_info("configure port %d quene %d %s\n", qd->portid, n,
-			(!c) ? "as not used" : "for client");
+		pr_info("q=%d nb_txd %u nb_rxd %u rx-mp %s\n",
+			n, nb_txd, nb_rxd, rx_mp->name);
 
 		ret = rte_eth_tx_queue_setup(qd->portid, n, nb_txd,
 					     SOCKET_ID_ANY, &txconf);
