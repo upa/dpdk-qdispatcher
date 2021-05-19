@@ -91,17 +91,17 @@ static int do_register(qdc_t *qdc)
 
 	fd = init_unix_sock();
 	if (fd < 0)
-		return -1;
+		return fd;
 
 	ret = send_msg(fd, (struct msg_hdr *)&qdc->reg, sizeof(qdc->reg),
 		       &rep);
 	if (ret < 0)
 		return ret;
 
-	if (rep.ret == 0) {
+	if (rep.ret == 0)
 		qdc->qnum = rep.qnum;
-		ret = rep.ret;
-	}
+
+	ret = rep.ret;
 
 	return ret;
 }
@@ -158,7 +158,7 @@ int qdc_unregister(qdc_t *qdc)
 
 	fd = init_unix_sock();
 	if (fd < 0)
-		return -1;
+		return fd;
 
 	ret = send_msg(fd, (struct msg_hdr *)&unreg, sizeof(unreg), &rep);
 	if (ret < 0)

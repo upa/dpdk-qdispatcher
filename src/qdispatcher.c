@@ -28,10 +28,11 @@ struct qdispatcher {
 	int portid;	/* physical port id. XXX: now always 0  */
 	struct rte_eth_conf 	conf;
 	struct rte_eth_dev_info	info;
+	struct rte_mempool	*default_rx_pool;
 
 	int fd;	/* unix domain socket fd */
 
-	int nqueues;
+	int nqueues;			/* # of queues enabled */
 	struct client **clients;	/* number of nqueues array of
 					 * struct client
 					 * pointers. each index
@@ -46,7 +47,7 @@ static struct qdispatcher qd;
 /**** restart the port ****/
 static int restart_port(struct qdispatcher *qd)
 {
-	int ret, n, max_qnum = -1;
+	int ret, n;
 	uint16_t max_txd = 512, max_rxd = 512;
 
 	/* stop, configure, queue stup, and start*/
@@ -54,22 +55,16 @@ static int restart_port(struct qdispatcher *qd)
 	for (n = 0; n < qd->nqueues; n++) {
 		struct client *c = qd->clients[n];
 		if (c) {
-			max_qnum = max(max_qnum, c->qnum);
 			max_txd = max(max_txd, c->reg.nb_txd);
 			max_rxd = max(max_rxd, c->reg.nb_rxd);
 		}
 	}
-	if (max_qnum < 0) {
-		pr_info("no queues registered, stop device\n");
-		return 0; /* keep device stopping */
-	}
-	max_qnum++; /* queue number + 1 means number of queues */
 
 	/* stop */
 	ret = rte_eth_dev_stop(qd->portid);
 	if (ret < 0) {
 		pr_err("failed to stop port %d\n", qd->portid);
-		return -EBUSY;
+		return ret;
 	}
 
 	/* configure port */
@@ -80,7 +75,8 @@ static int restart_port(struct qdispatcher *qd)
 		return -EINVAL;
 	}
 
-	ret = rte_eth_dev_configure(qd->portid, max_qnum, max_qnum, &qd->conf);
+	ret = rte_eth_dev_configure(qd->portid, qd->nqueues, qd->nqueues,
+				    &qd->conf);
 	if (ret < 0) {
 		pr_err("failed to configure port %d: %s\n",
 		       qd->portid, rte_strerror(rte_errno));
@@ -90,20 +86,39 @@ static int restart_port(struct qdispatcher *qd)
 	/* configure queues */
 	for (n = 0; n < qd->nqueues; n++) {
 		struct client *c = qd->clients[n];
-		if (!c)
-			continue;
+		struct rte_eth_txconf txconf;
+		struct rte_eth_rxconf rxconf;
+		struct rte_mempool *rx_mp;
+		uint16_t nb_txd, nb_rxd;
 
-		pr_info("configure port %d quene %d\n", qd->portid, n);
-		ret = rte_eth_tx_queue_setup(qd->portid, n, c->reg.nb_txd,
-					     SOCKET_ID_ANY, &c->reg.txconf);
+		if (!c) {
+			/* this queue is not used. so setup it with default */
+			rx_mp = qd->default_rx_pool;
+			nb_txd = 512;
+			nb_rxd = 512;
+			txconf = qd->info.default_txconf;
+			rxconf = qd->info.default_rxconf;
+		} else {
+			rx_mp = c->rx_mp;
+			nb_txd = c->reg.nb_txd;
+			nb_rxd = c->reg.nb_rxd;
+			txconf = c->reg.txconf;
+			rxconf = c->reg.rxconf;
+
+		}
+
+		pr_info("configure port %d quene %d %s\n", qd->portid, n,
+			(!c) ? "as not used" : "for client");
+
+		ret = rte_eth_tx_queue_setup(qd->portid, n, nb_txd,
+					     SOCKET_ID_ANY, &txconf);
 		if (ret < 0) {
 			pr_err("failed to configure tx q %d: %s\n",
 			       n, rte_strerror(rte_errno));
 		}
 
-		ret = rte_eth_rx_queue_setup(qd->portid, n, c->reg.nb_rxd,
-					     SOCKET_ID_ANY, &c->reg.rxconf,
-					     c->rx_mp);
+		ret = rte_eth_rx_queue_setup(qd->portid, n, nb_rxd,
+					     SOCKET_ID_ANY, &rxconf, rx_mp);
 		if (ret < 0) {
 			pr_err("failed to configure rx q %d: %s\n",
 			       n, rte_strerror(rte_errno));
@@ -118,6 +133,14 @@ static int restart_port(struct qdispatcher *qd)
 		pr_err("failed to start port %d: %s\n",
 		       qd->portid, rte_strerror(rte_errno));
 		return -EINVAL;
+	}
+
+	/* stop unused queues */
+	for (n = 0; n < qd->nqueues; n++) {
+		if (!qd->clients[n]) {
+			rte_eth_dev_tx_queue_stop(qd->portid, n);
+			rte_eth_dev_rx_queue_stop(qd->portid, n);
+		}
 	}
 
 	pr_info("restart port %d done\n", qd->portid);
@@ -160,6 +183,8 @@ static void send_reply(int fd, int ret, int qnum)
 {
 	struct msg_reply rep;
 	int r;
+
+	pr_info("ret %d qnum %d\n", ret, qnum);
 
 	rep.hdr.type = QDISPATCHER_MSG_TYPE_REPLY;
 	rep.ret = ret;
@@ -329,9 +354,16 @@ static int init_unix_sock(void)
 	return fd;
 }
 
+void usage(void)
+{
+	printf("usage: dpdk-qdispatcher\n"
+	       "    -n NUM     max number of queues and clients\n"
+	       "\n");
+}
+
 int main(int argc, char **argv)
 {
-	int ret;
+	int ret, ch;
 
 	ret = rte_eal_init(argc, argv);
 	if (ret < 0)
@@ -344,7 +376,34 @@ int main(int argc, char **argv)
 	/* initialize qdispatcher */
 	memset(&qd, 0, sizeof(qd));
 	qd.portid = 0;	/* XXX: implement qdispater_parse_args() */
+	qd.nqueues = 16; /* default 16 */
 
+	argc--;
+	argv++;
+	while ((ch = getopt(argc, argv, "n:h")) != -1) {
+		switch (ch) {
+		case 'n':
+			qd.nqueues = atoi(optarg);
+			break;
+		case 'h':
+		default:
+			usage();
+			return -1;
+		}
+	}
+
+	qd.default_rx_pool = rte_pktmbuf_pool_create("default-rx-pool",
+						     512 * qd.nqueues,
+						     0, 0,
+						     RTE_MBUF_DEFAULT_BUF_SIZE,
+						     rte_socket_id());
+	if (!qd.default_rx_pool) {
+		pr_err("failed to allocate default rx mbuf pool: %s\n",
+		       rte_strerror(rte_errno));
+		return -1;
+	}
+
+	/* init server socket */
 	qd.fd = init_unix_sock();
 	if (qd.fd < 0)
 		return -1;
@@ -360,7 +419,7 @@ int main(int argc, char **argv)
 	/* XXX */
 	qd.conf.txmode.offloads = qd.info.tx_offload_capa;
 	qd.conf.rxmode.offloads = (DEV_RX_OFFLOAD_CHECKSUM |
-                                     DEV_RX_OFFLOAD_TCP_LRO |
+				   DEV_RX_OFFLOAD_TCP_LRO |
 				   DEV_RX_OFFLOAD_SCATTER); /* XXX: LRO only */
 	qd.conf.rxmode.max_lro_pkt_size = qd.info.max_lro_pkt_size;
 
@@ -368,11 +427,12 @@ int main(int argc, char **argv)
 	qd.conf.rxmode.mq_mode = ETH_MQ_RX_NONE;
 
 	/* prepare array for pointers of struct clinet */
-	qd.nqueues = min(qd.info.max_tx_queues, qd.info.max_rx_queues);
 	qd.clients = calloc(qd.nqueues, sizeof(struct client *));
 	if (!qd.clients)
 		rte_exit(EXIT_FAILURE, "failed to alloc client array\n");
 	memset(qd.clients, 0, qd.nqueues * sizeof(struct client *));
+
+	pr_info("we can accomodate %d clients\n", qd.nqueues);
 
 	return dispatch_loop(&qd);
 }
