@@ -19,8 +19,10 @@
 /* structure describing client process */
 struct client {
 	int qnum;	/* queue number for the client */
+	struct msg_register 	reg;
+
 	struct rte_mempool	*rx_mp;	/* rx mempool in the client */
-	struct msg_register reg;
+	struct rte_flow		*flow;	/* mac -> queue flow rule */
 };
 
 /* structure describing qdispatcher process */
@@ -43,6 +45,68 @@ struct qdispatcher {
 
 static struct qdispatcher qd;
 
+
+char *mac_addr(struct rte_ether_addr *mac)
+{
+	static char m[32];
+	rte_ether_format_addr(m, sizeof(m), mac);
+	return m;
+}
+
+/**** flow rule *****/
+int install_mac_queue_flow(struct client *c)
+{
+	struct rte_flow_item item[2];	/* 0 is mac, 1 is end item */
+	struct rte_flow_action act[2];	/* 0 is queue, 1 is end item */
+	struct rte_flow_error err;
+
+	struct rte_flow_item_eth eth, mask;
+	struct rte_flow_action_queue queue;
+	struct rte_flow *flow;
+
+	struct rte_flow_attr attr = {
+		.group 		= 0,
+		.priority	= 2,
+		.ingress	= 1,
+		.egress		= 0,
+		.transfer	= 1,
+	};
+
+	memset(item, 0, sizeof(item));
+	memset(act, 0, sizeof(act));
+
+	/* matching eth dst mac */
+	item[0].type = RTE_FLOW_ITEM_TYPE_ETH;
+	item[0].spec = &eth;
+	item[0].last = NULL;
+	item[0].mask = &mask;
+	memset(&eth, 0, sizeof(eth));
+	memcpy(&eth.hdr.d_addr, &c->reg.mac, sizeof(c->reg.mac));
+	memset(&mask.hdr.d_addr, 0xFF, sizeof(mask.hdr.d_addr));
+
+	item[1].type = RTE_FLOW_ITEM_TYPE_END;
+
+	/* action, redirect to the specified queue */
+	act[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+	act[0].conf = &queue;
+	queue.index = c->qnum;
+
+	act[1].type = RTE_FLOW_ACTION_TYPE_END;
+
+	flow = rte_flow_create(qd.portid, &attr, item, act, &err);
+	if (!flow) {
+		pr_err("failed to create flow: port %d q %d mac %s "
+		       "rte_errno:%s type:%d message:%s\n",
+		       qd.portid, c->qnum, mac_addr(&c->reg.mac),
+		       rte_strerror(rte_errno), err.type, err.message);
+		assert(0);
+		return -1;
+	}
+
+	c->flow = flow;
+
+	return 0;
+}
 
 /**** restart the port ****/
 static int restart_port(struct qdispatcher *qd)
@@ -125,8 +189,6 @@ static int restart_port(struct qdispatcher *qd)
 		}
 	}
 
-	/* XXX: configure rte_flow for mac per queue here */
-
 	/* start */
 	ret = rte_eth_dev_start(qd->portid);
 	if (ret < 0) {
@@ -135,15 +197,20 @@ static int restart_port(struct qdispatcher *qd)
 		return -EINVAL;
 	}
 
-	/* stop unused queues */
+	/* configure flows. note that flow can be installed after port
+	 * is started. And, stop unused queues */
 	for (n = 0; n < qd->nqueues; n++) {
-		if (!qd->clients[n]) {
+		struct client *c = qd->clients[n];
+		if (c) {
+			install_mac_queue_flow(c);
+		} else {
 			rte_eth_dev_tx_queue_stop(qd->portid, n);
 			rte_eth_dev_rx_queue_stop(qd->portid, n);
 		}
 	}
 
 	pr_info("restart port %d done\n", qd->portid);
+
 	return 0;
 }
 
