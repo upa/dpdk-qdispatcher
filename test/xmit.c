@@ -16,6 +16,12 @@
 struct rte_mempool *rx_mp, *tx_mp;
 struct rte_ether_addr mac;
 
+struct param {
+	int portid;
+	int procn;
+	int loop_count;
+} p;
+
 qdc_t *try_register(int procn)
 {
 	struct rte_eth_dev_info info;
@@ -25,7 +31,7 @@ qdc_t *try_register(int procn)
 	qdc_t *qdc;
 	int ret;
 
-	ret = rte_eth_dev_info_get(0, &info);
+	ret = rte_eth_dev_info_get(p.portid, &info);
 	if (ret < 0) {
 		pr_err("failed to get dev info of port 0\n");
 		return NULL;
@@ -69,10 +75,6 @@ int try_unregister(qdc_t *qdc)
 
 
 
-struct param {
-	int procn;
-	int loop_count;
-} p;
 
 #define BURST	8
 
@@ -95,7 +97,7 @@ int xmit_one_iter(int qnum, struct rte_mempool *tx_mp)
 		eth->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 	}
 
-	return rte_eth_tx_burst(0, qnum, pkts, BURST);
+	return rte_eth_tx_burst(p.portid, qnum, pkts, BURST);
 }
 
 
@@ -125,7 +127,11 @@ int xmit(int qnum)
 
 void usage(void)
 {
-	printf("usage: test-xmit -n [PROCESS_NUMBER] -c [LOOP_COUNT]\n");
+	printf("usage: test-xmit\n"
+	       "    -p [PORT]\n"
+	       "    -n [PROCESS_NUMBER]\n"
+	       "    -c [LOOP_COUNT]\n"
+	       "\n");
 }
 
 int main(int argc, char **argv)
@@ -137,14 +143,18 @@ int main(int argc, char **argv)
 	if (ret < 0)
 		rte_panic("cannot init EAL\n");
 
+	p.portid = 0;
 	p.procn = 0;
 	p.loop_count = 1;
 
 	argc--;
 	argv++;
 
-	while ((ch = getopt(argc, argv, "n:c:h")) != -1) {
+	while ((ch = getopt(argc, argv, "p:n:c:h")) != -1) {
 		switch (ch) {
+		case 'p':
+			p.portid = atoi(optarg);
+			break;
 		case 'n':
 			p.procn = atoi(optarg);
 			break;

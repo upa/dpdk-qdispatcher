@@ -25,7 +25,7 @@ struct client {
 
 /* structure describing qdispatcher process */
 struct qdispatcher {
-	int portid;	/* physical port id. XXX: now always 0  */
+	int portid;	/* physical port id */
 	struct rte_eth_conf 	conf;
 	struct rte_eth_dev_info	info;
 	struct rte_mempool	*default_rx_pool;
@@ -357,6 +357,7 @@ static int init_unix_sock(void)
 void usage(void)
 {
 	printf("usage: dpdk-qdispatcher\n"
+	       "    -p PORT    dpdk port id\n"
 	       "    -n NUM     max number of queues and clients\n"
 	       "\n");
 }
@@ -375,13 +376,16 @@ int main(int argc, char **argv)
 
 	/* initialize qdispatcher */
 	memset(&qd, 0, sizeof(qd));
-	qd.portid = 0;	/* XXX: implement qdispater_parse_args() */
-	qd.nqueues = 16; /* default 16 */
+	qd.portid = 0;
+	qd.nqueues = 16;
 
 	argc--;
 	argv++;
-	while ((ch = getopt(argc, argv, "n:h")) != -1) {
+	while ((ch = getopt(argc, argv, "p:n:h")) != -1) {
 		switch (ch) {
+		case 'p':
+			qd.portid = atoi(optarg);
+			break;
 		case 'n':
 			qd.nqueues = atoi(optarg);
 			break;
