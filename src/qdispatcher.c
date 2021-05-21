@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -431,7 +432,12 @@ void usage(void)
 
 int main(int argc, char **argv)
 {
-	int ret, ch;
+	int ret, opt;
+	struct option lgopts[] = {
+		{ "port", required_argument, NULL, 'p' },
+		{ "num", required_argument, NULL, 'n' },
+		{ NULL, 0, 0, 0 },
+	};
 
 	ret = rte_eal_init(argc, argv);
 	if (ret < 0)
@@ -446,10 +452,11 @@ int main(int argc, char **argv)
 	qd.portid = 0;
 	qd.nqueues = 16;
 
-	argc--;
-	argv++;
-	while ((ch = getopt(argc, argv, "p:n:h")) != -1) {
-		switch (ch) {
+	argc -=ret;
+	argv += ret;
+
+	while ((opt = getopt_long(argc, argv, "p:n:h", lgopts, NULL)) != -1) {
+		switch (opt) {
 		case 'p':
 			qd.portid = atoi(optarg);
 			break;
