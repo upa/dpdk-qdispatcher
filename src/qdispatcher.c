@@ -33,6 +33,8 @@ struct qdispatcher {
 	struct rte_eth_dev_info	info;
 	struct rte_mempool	*default_rx_pool;
 
+	struct rte_flow		*flow;	/* flow for broadcast/multicast*/
+
 	int fd;	/* unix domain socket fd */
 
 	int nqueues;			/* # of queues enabled */
@@ -42,6 +44,8 @@ struct qdispatcher {
 					 * indicates a queue number
 					 * for the client.
 					 */
+
+	bool enable_flow;	/* install rte_flow for mac/queue mapping */
 };
 
 static struct qdispatcher qd;
@@ -70,7 +74,7 @@ int install_mac_queue_flow(struct client *c)
 		.priority	= 2,
 		.ingress	= 1,
 		.egress		= 0,
-		.transfer	= 1,
+		.transfer	= 0,
 	};
 
 	memset(item, 0, sizeof(item));
@@ -82,6 +86,7 @@ int install_mac_queue_flow(struct client *c)
 	item[0].last = NULL;
 	item[0].mask = &mask;
 	memset(&eth, 0, sizeof(eth));
+	memset(&mask, 0, sizeof(mask));
 	memcpy(&eth.hdr.d_addr, &c->reg.mac, sizeof(c->reg.mac));
 	memset(&mask.hdr.d_addr, 0xFF, sizeof(mask.hdr.d_addr));
 
@@ -100,11 +105,76 @@ int install_mac_queue_flow(struct client *c)
 		       "rte_errno:%s type:%d message:%s\n",
 		       qd.portid, c->qnum, mac_addr(&c->reg.mac),
 		       rte_strerror(rte_errno), err.type, err.message);
-		assert(0);
 		return -1;
 	}
 
 	c->flow = flow;
+
+	return 0;
+}
+
+int install_bm_queue_flow(struct qdispatcher *qd)
+{
+	struct rte_flow_item item[2];	/* 0 is mac, 1 is end item */
+	struct rte_flow_action act[qd->nqueues + 1]; /* queueus and end */
+	struct rte_flow_error err;
+
+	struct rte_flow_item_eth eth, mask;
+	struct rte_flow_action_queue queue[qd->nqueues];
+	struct rte_flow *flow;
+
+	struct rte_flow_attr attr = {
+		.group		= 0,
+		.priority	= 1,
+		.ingress	= 1,
+		.egress		= 0,
+		.transfer	= 0,
+	};
+
+	int n;
+
+	memset(item, 0, sizeof(item));
+	memset(act, 0, sizeof(act));
+	memset(queue, 0, sizeof(queue));
+
+	/* matching eth dst mac whose group bit is 1 */
+	item[0].type = RTE_FLOW_ITEM_TYPE_ETH;
+	item[0].spec = &eth;
+	item[0].last = NULL;
+	item[0].mask = &mask;
+	memset(&eth, 0, sizeof(eth));
+	memset(&mask, 0, sizeof(mask));
+	eth.hdr.d_addr.addr_bytes[0] = RTE_ETHER_GROUP_ADDR;
+	mask.hdr.d_addr.addr_bytes[0] = RTE_ETHER_GROUP_ADDR;
+
+	item[1].type = RTE_FLOW_ITEM_TYPE_END;
+
+	/* action, redirect broadcast/multicast packets to the queues
+	 * used by clients. when multiple queue actions exist, the
+	 * matched packets are copied to the queues. TYPE_VOID is just
+	 * ignored by pmd. see "12.2.7. Actions" section in
+	 * https://doc.dpdk.org/guides/prog_guide/rte_flow.html */
+	for (n = 0; n < qd->nqueues; n++) {
+		struct client *c = qd->clients[n];
+		if (c) {
+			act[n].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+			act[n].conf = &queue[n];
+			queue[n].index = c->qnum;
+		} else
+			act[n].type = RTE_FLOW_ACTION_TYPE_VOID;
+	}
+
+	act[n].type = RTE_FLOW_ACTION_TYPE_END;
+
+	flow = rte_flow_create(qd->portid, &attr, item, act, &err);
+	if (!flow) {
+		pr_err("failed to create flow for broadcast/multicast: "
+		       "port %d rte_errno:%s type:%d message:%s\n", qd->portid,
+		       rte_strerror(rte_errno), err.type, err.message);
+		return -1;
+	}
+
+	qd->flow = flow;
 
 	return 0;
 }
@@ -114,6 +184,7 @@ static int restart_port(struct qdispatcher *qd)
 {
 	int ret, n;
 	uint16_t max_txd = 512, max_rxd = 512;
+	struct rte_flow_error err;
 
 	/* stop, configure, queue stup, and start*/
 
@@ -130,6 +201,17 @@ static int restart_port(struct qdispatcher *qd)
 	if (ret < 0) {
 		pr_err("failed to stop port %d\n", qd->portid);
 		return ret;
+	}
+
+	/* flush all flows */
+	if (qd->enable_flow) {
+		ret = rte_flow_flush(qd->portid, &err);
+		if (ret < 0) {
+			pr_err("failed to flush flow: port %d "
+			       "rte_errno: %s type: %d mesage:%s\n",
+			       qd->portid, rte_strerror(rte_errno),
+			       err.type, err.message);
+		}
 	}
 
 	/* configure port */
@@ -198,17 +280,20 @@ static int restart_port(struct qdispatcher *qd)
 		return -EINVAL;
 	}
 
-	/* configure flows. note that flow can be installed after port
-	 * is started. And, stop unused queues */
+	/*  stop unused queues, and configure flows if enabled. note
+	 * that flow can be installed after port is started. */
 	for (n = 0; n < qd->nqueues; n++) {
 		struct client *c = qd->clients[n];
-		if (c) {
+		if (c && qd->enable_flow) {
 			install_mac_queue_flow(c);
 		} else {
 			rte_eth_dev_tx_queue_stop(qd->portid, n);
 			rte_eth_dev_rx_queue_stop(qd->portid, n);
 		}
 	}
+
+	if (qd->enable_flow)
+		install_bm_queue_flow(qd);
 
 	pr_info("restart port %d done\n", qd->portid);
 
@@ -427,6 +512,7 @@ void usage(void)
 	printf("usage: dpdk-qdispatcher\n"
 	       "    -p PORT    dpdk port id\n"
 	       "    -n NUM     max number of queues and clients\n"
+	       "    -f         install rte_flow for mac/queue mapping\n"
 	       "\n");
 }
 
@@ -436,6 +522,7 @@ int main(int argc, char **argv)
 	struct option lgopts[] = {
 		{ "port", required_argument, NULL, 'p' },
 		{ "num", required_argument, NULL, 'n' },
+		{ "enable-flow", no_argument, NULL, 'f' },
 		{ NULL, 0, 0, 0 },
 	};
 
@@ -451,17 +538,21 @@ int main(int argc, char **argv)
 	memset(&qd, 0, sizeof(qd));
 	qd.portid = 0;
 	qd.nqueues = 16;
+	qd.enable_flow = false;
 
 	argc -=ret;
 	argv += ret;
 
-	while ((opt = getopt_long(argc, argv, "p:n:h", lgopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:n:fh", lgopts, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
 			qd.portid = atoi(optarg);
 			break;
 		case 'n':
 			qd.nqueues = atoi(optarg);
+			break;
+		case 'f':
+			qd.enable_flow = true;
 			break;
 		case 'h':
 		default:
