@@ -33,7 +33,7 @@ qdc_t *try_register(int procn)
 
 	ret = rte_eth_dev_info_get(p.portid, &info);
 	if (ret < 0) {
-		pr_err("failed to get dev info of port 0\n");
+		pr_err("failed to get dev info of port %d\n", p.portid);
 		return NULL;
 	}
 
@@ -147,8 +147,8 @@ int main(int argc, char **argv)
 	p.procn = 0;
 	p.loop_count = 1;
 
-	argc--;
-	argv++;
+	argc -= ret;
+	argv += ret;
 
 	while ((ch = getopt(argc, argv, "p:n:c:h")) != -1) {
 		switch (ch) {
