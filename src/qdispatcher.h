@@ -14,7 +14,8 @@ enum {
 	QDISPATCHER_MSG_TYPE_REGISTER,
 	QDISPATCHER_MSG_TYPE_UNREGISTER,
 	QDISPATCHER_MSG_TYPE_REPLY,
- };
+	QDISPATCHER_MSG_TYPE_FRAME,
+};
 
 struct msg_hdr {
 	int type;
@@ -42,6 +43,10 @@ struct msg_reply {
 	int	qnum;
 };
 
+struct msg_frame {
+	struct msg_hdr hdr;
+	char frame[0];
+};
 
 
 #endif /* _QDISPATCHER_H_ */

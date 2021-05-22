@@ -13,7 +13,7 @@ target_include_directories(dpdk-qdispatcher PUBLIC
 				./src
 				${LIBDPDK_INCLUDE_DIRS}
 				)
-target_link_libraries(dpdk-qdispatcher ${LIBDPDK_LIBRARIES})
+target_link_libraries(dpdk-qdispatcher pthread ${LIBDPDK_LIBRARIES})
 target_compile_options(dpdk-qdispatcher PRIVATE ${LIBDPDK_CFLAGS_OTHER})
 
 # libqdc
@@ -23,7 +23,7 @@ target_include_directories(qdc PUBLIC
 				./src
 				${LIBDPDK_INCLUDE_DIRS}
 				)
-target_link_libraries(qdc ${LIBDPDK_LIBRARIES})
+target_link_libraries(qdc pthread ${LIBDPDK_LIBRARIES})
 target_compile_options(qdc PRIVATE ${LIBDPDK_CFLAGS_OTHER})
 
 add_subdirectory(./test)

@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/uio.h>
+#include <pthread.h>
 
 #include <rte_eal.h>
 #include <rte_malloc.h>
@@ -19,6 +21,7 @@
 
 /* structure describing client process */
 struct client {
+	int fd;		/* accepted socket */
 	int qnum;	/* queue number for the client */
 	struct msg_register 	reg;
 
@@ -44,8 +47,7 @@ struct qdispatcher {
 					 * indicates a queue number
 					 * for the client.
 					 */
-
-	bool enable_flow;	/* install rte_flow for mac/queue mapping */
+	pthread_mutex_t	clients_lock;
 };
 
 static struct qdispatcher qd;
@@ -59,7 +61,9 @@ char *mac_addr(struct rte_ether_addr *mac)
 }
 
 /**** flow rule *****/
-int install_mac_queue_flow(struct client *c)
+struct rte_flow *install_dst_mac_queue_flow(struct rte_ether_addr dst_mac,
+					    struct rte_ether_addr dst_mask,
+					    uint16_t qnum)
 {
 	struct rte_flow_item item[2];	/* 0 is mac, 1 is end item */
 	struct rte_flow_action act[2];	/* 0 is queue, 1 is end item */
@@ -87,15 +91,15 @@ int install_mac_queue_flow(struct client *c)
 	item[0].mask = &mask;
 	memset(&eth, 0, sizeof(eth));
 	memset(&mask, 0, sizeof(mask));
-	memcpy(&eth.hdr.d_addr, &c->reg.mac, sizeof(c->reg.mac));
-	memset(&mask.hdr.d_addr, 0xFF, sizeof(mask.hdr.d_addr));
+	eth.hdr.d_addr = dst_mac;
+	mask.hdr.d_addr = dst_mask;
 
 	item[1].type = RTE_FLOW_ITEM_TYPE_END;
 
 	/* action, redirect to the specified queue */
 	act[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
 	act[0].conf = &queue;
-	queue.index = c->qnum;
+	queue.index = qnum;
 
 	act[1].type = RTE_FLOW_ACTION_TYPE_END;
 
@@ -103,78 +107,39 @@ int install_mac_queue_flow(struct client *c)
 	if (!flow) {
 		pr_err("failed to create flow: port %d q %d mac %s "
 		       "rte_errno:%s type:%d message:%s\n",
-		       qd.portid, c->qnum, mac_addr(&c->reg.mac),
+		       qd.portid, qnum, mac_addr(&dst_mac),
 		       rte_strerror(rte_errno), err.type, err.message);
-		return -1;
+		return NULL;
 	}
 
-	c->flow = flow;
+	return 0;
+}
+
+
+int install_client_flow(struct client *c)
+{
+	struct rte_ether_addr mask;
+
+	memset(&mask, 0xFF, sizeof(mask));	/* all bit 1 */
+	c->flow = install_dst_mac_queue_flow(c->reg.mac, mask, c->qnum);
+
+	if (!c->flow)
+		return -1;
 
 	return 0;
 }
 
 int install_bm_queue_flow(struct qdispatcher *qd)
 {
-	struct rte_flow_item item[2];	/* 0 is mac, 1 is end item */
-	struct rte_flow_action act[qd->nqueues + 1]; /* queueus and end */
-	struct rte_flow_error err;
+	struct rte_ether_addr mac, mask;
 
-	struct rte_flow_item_eth eth, mask;
-	struct rte_flow_action_queue queue[qd->nqueues];
-	struct rte_flow *flow;
+	mac.addr_bytes[0] = RTE_ETHER_GROUP_ADDR;
+	mask.addr_bytes[0] = RTE_ETHER_GROUP_ADDR;
 
-	struct rte_flow_attr attr = {
-		.group		= 0,
-		.priority	= 1,
-		.ingress	= 1,
-		.egress		= 0,
-		.transfer	= 0,
-	};
+	qd->flow = install_dst_mac_queue_flow(mac, mask, 0);
 
-	int n;
-
-	memset(item, 0, sizeof(item));
-	memset(act, 0, sizeof(act));
-	memset(queue, 0, sizeof(queue));
-
-	/* matching eth dst mac whose group bit is 1 */
-	item[0].type = RTE_FLOW_ITEM_TYPE_ETH;
-	item[0].spec = &eth;
-	item[0].last = NULL;
-	item[0].mask = &mask;
-	memset(&eth, 0, sizeof(eth));
-	memset(&mask, 0, sizeof(mask));
-	eth.hdr.d_addr.addr_bytes[0] = RTE_ETHER_GROUP_ADDR;
-	mask.hdr.d_addr.addr_bytes[0] = RTE_ETHER_GROUP_ADDR;
-
-	item[1].type = RTE_FLOW_ITEM_TYPE_END;
-
-	/* action, redirect broadcast/multicast packets to the queues
-	 * used by clients. when multiple queue actions exist, the
-	 * matched packets are copied to the queues. TYPE_VOID is just
-	 * ignored by pmd. see "12.2.7. Actions" section in
-	 * https://doc.dpdk.org/guides/prog_guide/rte_flow.html */
-	for (n = 0; n < qd->nqueues; n++) {
-		struct client *c = qd->clients[n];
-		if (c) {
-			act[n].type = RTE_FLOW_ACTION_TYPE_QUEUE;
-			act[n].conf = &queue[n];
-			queue[n].index = c->qnum;
-		} else
-			act[n].type = RTE_FLOW_ACTION_TYPE_VOID;
-	}
-
-	act[n].type = RTE_FLOW_ACTION_TYPE_END;
-
-	flow = rte_flow_create(qd->portid, &attr, item, act, &err);
-	if (!flow) {
-		pr_err("failed to create flow for broadcast/multicast: "
-		       "port %d rte_errno:%s type:%d message:%s\n", qd->portid,
-		       rte_strerror(rte_errno), err.type, err.message);
+	if (!qd->flow)
 		return -1;
-	}
-
-	qd->flow = flow;
 
 	return 0;
 }
@@ -204,14 +169,12 @@ static int restart_port(struct qdispatcher *qd)
 	}
 
 	/* flush all flows */
-	if (qd->enable_flow) {
-		ret = rte_flow_flush(qd->portid, &err);
-		if (ret < 0) {
-			pr_err("failed to flush flow: port %d "
-			       "rte_errno: %s type: %d mesage:%s\n",
-			       qd->portid, rte_strerror(rte_errno),
-			       err.type, err.message);
-		}
+	ret = rte_flow_flush(qd->portid, &err);
+	if (ret < 0) {
+		pr_err("failed to flush flow: port %d "
+		       "rte_errno: %s type: %d mesage:%s\n",
+		       qd->portid, rte_strerror(rte_errno),
+		       err.type, err.message);
 	}
 
 	/* configure port */
@@ -230,7 +193,7 @@ static int restart_port(struct qdispatcher *qd)
 		return -EINVAL;
 	}
 
-	/* configure queues */
+	/* configure queues including queue 0 for bm frames */
 	for (n = 0; n < qd->nqueues; n++) {
 		struct client *c = qd->clients[n];
 		struct rte_eth_txconf txconf;
@@ -251,7 +214,6 @@ static int restart_port(struct qdispatcher *qd)
 			nb_rxd = c->reg.nb_rxd;
 			txconf = c->reg.txconf;
 			rxconf = c->reg.rxconf;
-
 		}
 
 		pr_info("q=%d nb_txd %u nb_rxd %u rx-mp %s\n",
@@ -280,20 +242,22 @@ static int restart_port(struct qdispatcher *qd)
 		return -EINVAL;
 	}
 
-	/*  stop unused queues, and configure flows if enabled. note
-	 * that flow can be installed after port is started. */
-	for (n = 0; n < qd->nqueues; n++) {
+	/* install flows for passsing unicast frames to a
+	 * corresponding queue. and, stop unused queues */
+	for (n = 1; n < qd->nqueues; n++) {
 		struct client *c = qd->clients[n];
-		if (c && qd->enable_flow) {
-			install_mac_queue_flow(c);
+		if (c) {
+			install_client_flow(c);
 		} else {
 			rte_eth_dev_tx_queue_stop(qd->portid, n);
 			rte_eth_dev_rx_queue_stop(qd->portid, n);
 		}
 	}
 
-	if (qd->enable_flow)
-		install_bm_queue_flow(qd);
+	/* install a flow for passing broadcast/multicast frames to
+	 * queue 0. the frams are copied to all clients via unix
+	 * sockets */
+	install_bm_queue_flow(qd);
 
 	pr_info("restart port %d done\n", qd->portid);
 
@@ -302,7 +266,8 @@ static int restart_port(struct qdispatcher *qd)
 
 /**** handle register ****/
 
-struct client *create_client_from_register(struct msg_register *reg, int *ret)
+struct client *create_client_from_register(int fd,
+					   struct msg_register *reg, int *ret)
 {
 	struct client *c;
 
@@ -322,6 +287,7 @@ struct client *create_client_from_register(struct msg_register *reg, int *ret)
 		goto free_out;
 	}
 
+	c->fd = fd;
 	c->reg = *reg;
 	*ret = 0;
 
@@ -355,14 +321,17 @@ static void handle_register(struct qdispatcher *qd, int fd,
 	struct client *c;
 	int n, q, ret = 0;
 
-	c = create_client_from_register(reg, &ret);
+	c = create_client_from_register(fd, reg, &ret);
 	if (!c || ret != 0) {
 		pr_err("failed to add client\n");
 		goto out;
 	}
 
-	/* find an available queue number for this client*/
-	for (q = -1, n = 0; n < qd->nqueues; n++) {
+	/* find an available queue number for this client. queue 0 is
+	 * reserved to receive broadcast/muticast frames by
+	 * qdispatcher. so, find the available queue from 1.
+	 */
+	for (q = -1, n = 1; n < qd->nqueues; n++) {
 		if (qd->clients[n] == NULL) {
 			q = n;
 			c->qnum = n;
@@ -384,7 +353,7 @@ out:
 	if (c)
 		send_reply(fd, ret, q);
 
-	if (ret < 0) /* faileed to register. release the client */
+	if (ret < 0) /* failed to register. release the client */
 		free(c);
 }
 
@@ -418,8 +387,12 @@ static void handle_unregister(struct qdispatcher *qd, int fd,
 reply_out:
 	send_reply(fd, ret, unreg->qnum);
 
-	if (ret == 0) /* success  */
+	if (ret == 0) { /* success  */
+		close(remove->fd);
 		free(remove);
+	}
+
+	close(fd);
 }
 
 static int dispatch_loop(struct qdispatcher *qd)
@@ -447,10 +420,13 @@ static int dispatch_loop(struct qdispatcher *qd)
 		ret = read(fd, buf, sizeof(buf));
 		if (ret < 0) {
 			pr_err("read failed: %s\n", strerror(errno));
-			goto close_fd;
+			close(fd);
+			continue;
 		}
 
 		hdr = (struct msg_hdr *)buf;
+
+		pthread_mutex_lock(&qd->clients_lock);
 
 		switch (hdr->type) {
 		case QDISPATCHER_MSG_TYPE_REGISTER:
@@ -472,11 +448,69 @@ static int dispatch_loop(struct qdispatcher *qd)
 			break;
 		}
 
-	close_fd:
-		close(fd);
+		pthread_mutex_unlock(&qd->clients_lock);
 	}
 
 	return 0;
+}
+
+/* transferring broadcast/multicast frams via sockets */
+static void send_bm_frame(struct rte_mbuf *pkt, struct client *c)
+{
+	struct iovec iov[pkt->nb_segs + 1]; /* 0 is msg_frame */
+	struct msg_frame frame;
+	struct rte_mbuf *m;
+	int n, ret;
+
+	frame.hdr.type = QDISPATCHER_MSG_TYPE_FRAME;
+	iov[0].iov_base = &frame;
+	iov[1].iov_len = sizeof(frame);
+
+	m = pkt;
+	for (n = 0; n < pkt->nb_segs; n++) {
+		iov[n + 1].iov_base = rte_pktmbuf_mtod(m, void *);
+		iov[n + 1].iov_len = m->buf_len;
+		m = m->next;
+	}
+
+	ret = writev(c->fd, iov, pkt->nb_segs + 1);
+	if (ret < 0) {
+		pr_err("failed to send packet to client: %s\n",
+		       strerror(errno));
+	}
+}
+
+#define BURST 16
+static void *handle_bm_thread(void *arg)
+{
+	struct qdispatcher *qd = arg;
+	struct rte_mbuf *pkts[BURST];
+	int n, i, nb_rx;
+
+	do {
+		nb_rx = rte_eth_rx_burst(qd->portid, 0, pkts, BURST);
+		if (nb_rx == 0) {
+			usleep(10);
+			continue;
+		}
+
+		pthread_mutex_lock(&qd->clients_lock);
+		for (n = 0; n < nb_rx; n++) {
+			for (i = 1; i < qd->nqueues; i++) {
+				struct client *c = qd->clients[i];
+				if (!c)
+					continue;
+				send_bm_frame(pkts[n], c);
+			}
+		}
+		pthread_mutex_unlock(&qd->clients_lock);
+
+		for (n = 0; n < nb_rx; n++)
+			rte_pktmbuf_free(pkts[n]);
+
+	} while (1);
+
+	return NULL;
 }
 
 
@@ -512,17 +546,16 @@ void usage(void)
 	printf("usage: dpdk-qdispatcher\n"
 	       "    -p PORT    dpdk port id\n"
 	       "    -n NUM     max number of queues and clients\n"
-	       "    -f         install rte_flow for mac/queue mapping\n"
 	       "\n");
 }
 
 int main(int argc, char **argv)
 {
 	int ret, opt;
+	pthread_t tid;
 	struct option lgopts[] = {
 		{ "port", required_argument, NULL, 'p' },
 		{ "num", required_argument, NULL, 'n' },
-		{ "enable-flow", no_argument, NULL, 'f' },
 		{ NULL, 0, 0, 0 },
 	};
 
@@ -538,7 +571,7 @@ int main(int argc, char **argv)
 	memset(&qd, 0, sizeof(qd));
 	qd.portid = 0;
 	qd.nqueues = 16;
-	qd.enable_flow = false;
+	pthread_mutex_init(&qd.clients_lock, NULL);
 
 	argc -=ret;
 	argv += ret;
@@ -550,9 +583,6 @@ int main(int argc, char **argv)
 			break;
 		case 'n':
 			qd.nqueues = atoi(optarg);
-			break;
-		case 'f':
-			qd.enable_flow = true;
 			break;
 		case 'h':
 		default:
@@ -602,6 +632,17 @@ int main(int argc, char **argv)
 	memset(qd.clients, 0, qd.nqueues * sizeof(struct client *));
 
 	pr_info("we can accomodate %d clients\n", qd.nqueues);
+
+	/* start port before start handle_bm_thread */
+	restart_port(&qd);
+
+	/* start handle_bm_thread on queue 0 */
+	ret = pthread_create(&tid, NULL, handle_bm_thread, &qd);
+	if (ret < 0) {
+		pr_err("failed to spawn handle_bm_thread: %s\n",
+		       strerror(errno));
+		return ret;
+	}
 
 	return dispatch_loop(&qd);
 }

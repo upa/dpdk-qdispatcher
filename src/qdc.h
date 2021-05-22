@@ -16,6 +16,10 @@ int qdc_unregister(qdc_t *qdc);
 
 int qdc_qnum(qdc_t *qdc);
 
-const char *qd_strerror(int ret);
+
+typedef void (*qdc_callback)(void *frame, size_t size, void *arg);
+
+int qdc_register_frame_cb(qdc_t *qdc, qdc_callback cb, void *arg);
+
 
 #endif /* _QDC_H_ */
