@@ -473,7 +473,7 @@ static void send_bm_frame(struct rte_mbuf *pkt, struct client *c)
 	m = pkt;
 	for (n = 0; n < pkt->nb_segs; n++) {
 		iov[n + 1].iov_base = rte_pktmbuf_mtod(m, void *);
-		iov[n + 1].iov_len = m->buf_len;
+		iov[n + 1].iov_len = m->data_len;
 		m = m->next;
 	}
 

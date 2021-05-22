@@ -8,6 +8,7 @@
 #include <rte_lcore.h>
 #include <rte_malloc.h>
 #include <rte_ethdev.h>
+#include <rte_hexdump.h>
 #include <rte_debug.h>
 
 #include <qdc.h>
@@ -70,6 +71,13 @@ void usage(void)
 	printf("usage: test-join-leave -n [PROCESS_NUMBER]\n");
 }
 
+void qdc_bm_cb(void *frame, size_t size, void *arg)
+{
+	pr_info("receive %lu-byte bm frame\n", size);
+	rte_hexdump(stdout, "bm frame dump", frame, 64);
+	printf("\n");
+}
+
 int main(int argc, char **argv)
 {
 	int ret, ch;
@@ -95,7 +103,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	printf("process number %d\n", procn);
+	pr_info("process number %d\n", procn);
 
 	qdc = try_register(procn);
 	if (!qdc) {
@@ -104,6 +112,11 @@ int main(int argc, char **argv)
 	}
 
 	pr_info("our queue number is %d\n", qdc_qnum(qdc));
+
+	pr_info("register dump framce callback\n");
+	ret = qdc_register_frame_cb(qdc, qdc_bm_cb, NULL);
+	if (ret < 0)
+		pr_err("failed to register callback\n");
 
 	printf("type Enter to unregister\n");
 	char buf[32];
