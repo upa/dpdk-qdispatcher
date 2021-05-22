@@ -14,6 +14,14 @@
 				 "ERR:%s(): " fmt "\x1b[0m",    \
 				 __func__, ##__VA_ARGS__)
 
+#define pr_debug(fmt, ...)					\
+	do {							\
+		if (debug)					\
+			fprintf(stdout, "DEBUG:%s(): " fmt,	\
+				__func__, ##__VA_ARGS__);	\
+	} while (0)
+
+
 #define min(a, b) (a > b) ? b : a
 #define max(a, b) (a > b) ? a : b
 

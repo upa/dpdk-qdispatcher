@@ -19,6 +19,8 @@
 #include <qdispatcher.h>
 #include <util.h>
 
+static int debug;	/* for pr_debug */
+
 /* structure describing client process */
 struct client {
 	int fd;		/* accepted socket */
@@ -305,7 +307,7 @@ static void send_reply(int fd, int ret, int qnum)
 	struct msg_reply rep;
 	int r;
 
-	pr_info("ret %d qnum %d\n", ret, qnum);
+	pr_debug("ret %d qnum %d\n", ret, qnum);
 
 	rep.hdr.type = QDISPATCHER_MSG_TYPE_REPLY;
 	rep.ret = ret;
@@ -466,7 +468,7 @@ static void send_bm_frame(struct rte_mbuf *pkt, struct client *c)
 
 	frame.hdr.type = QDISPATCHER_MSG_TYPE_FRAME;
 	iov[0].iov_base = &frame;
-	iov[1].iov_len = sizeof(frame);
+	iov[0].iov_len = sizeof(frame);
 
 	m = pkt;
 	for (n = 0; n < pkt->nb_segs; n++) {
@@ -492,12 +494,14 @@ static void *handle_bm_thread(void *arg)
 	do {
 		nb_rx = rte_eth_rx_burst(qd->portid, 0, pkts, BURST);
 		if (nb_rx == 0) {
-			usleep(10);
+			usleep(100);
 			continue;
 		}
 
 		pthread_mutex_lock(&qd->clients_lock);
 		for (n = 0; n < nb_rx; n++) {
+			pr_debug("send %d-byte bm frame to client(s)\n",
+				 pkts[n]->pkt_len);
 			for (i = 1; i < qd->nqueues; i++) {
 				struct client *c = qd->clients[i];
 				if (!c)
@@ -548,6 +552,7 @@ void usage(void)
 	printf("usage: dpdk-qdispatcher\n"
 	       "    -p PORT    dpdk port id\n"
 	       "    -n NUM     max number of queues and clients\n"
+	       "    -d         enable debug pring\n"
 	       "\n");
 }
 
@@ -558,6 +563,7 @@ int main(int argc, char **argv)
 	struct option lgopts[] = {
 		{ "port", required_argument, NULL, 'p' },
 		{ "num", required_argument, NULL, 'n' },
+		{ "debug", no_argument, NULL, 'd' },
 		{ NULL, 0, 0, 0 },
 	};
 
@@ -578,13 +584,16 @@ int main(int argc, char **argv)
 	argc -=ret;
 	argv += ret;
 
-	while ((opt = getopt_long(argc, argv, "p:n:fh", lgopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:n:dh", lgopts, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
 			qd.portid = atoi(optarg);
 			break;
 		case 'n':
 			qd.nqueues = atoi(optarg);
+			break;
+		case 'd':
+			debug++;
 			break;
 		case 'h':
 		default:
