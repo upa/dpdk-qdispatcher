@@ -38,7 +38,7 @@ qdc_t *try_register(int procn)
 	mac.addr_bytes[2] = 0x00;
 	mac.addr_bytes[3] = 0x00;
 	mac.addr_bytes[4] = 0x00;
-	mac.addr_bytes[5] = 0x00;
+	mac.addr_bytes[5] = procn;
 
 	snprintf(mp_name, sizeof(mp_name), "rx-pool-%d", procn);
 	mp = rte_pktmbuf_pool_create(mp_name, 1024, 0, 0,
@@ -80,8 +80,8 @@ int main(int argc, char **argv)
 	if (ret < 0)
 		rte_panic("cannot init EAL\n");
 
-	argc--;
-	argv++;
+	argc -= ret;
+	argv += ret;
 
 	while ((ch = getopt(argc, argv, "n:h")) != -1) {
 		switch (ch) {

@@ -216,8 +216,10 @@ static int restart_port(struct qdispatcher *qd)
 			rxconf = c->reg.rxconf;
 		}
 
-		pr_info("q=%d nb_txd %u nb_rxd %u rx-mp %s\n",
-			n, nb_txd, nb_rxd, rx_mp->name);
+		pr_info("q=%d txd %u rxd %u rx-mp %s %s\n",
+			n, nb_txd, nb_rxd, rx_mp->name,
+			(n == 0) ? "bm frames" :
+			(c) ? mac_addr(&c->reg.mac) : "unused");
 
 		ret = rte_eth_tx_queue_setup(qd->portid, n, nb_txd,
 					     SOCKET_ID_ANY, &txconf);
